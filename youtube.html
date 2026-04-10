@@ -1,29 +1,72 @@
-const iframe = document.querySelector('iframe');
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; background: #000; }
+    #player { width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="player"></div>
 
-// Gửi lệnh xuống player
-function playerCommand(action, time = null) {
-  const msg = time !== null ? { action, time } : { action };
-  iframe.contentWindow.postMessage(JSON.stringify(msg), '*');
-}
+  <script>
+    let player;
+    const params = new URLSearchParams(window.location.search);
+    const videoId = params.get('v');
 
-// Play / Pause / Seek
-playerCommand('play');
-playerCommand('pause');
-playerCommand('seekTo', 45.5); // seek đến giây 45.5
+    // Load YouTube IFrame API
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(tag);
 
-// Nhận currentTime để sync subtitle
-window.addEventListener('message', (e) => {
-  try {
-    const data = JSON.parse(e.data);
+    window.onYouTubeIframeAPIReady = function () {
+      player = new YT.Player('player', {
+        videoId: videoId,
+        playerVars: {
+          controls: 1,
+          playsinline: 1,
+          rel: 0,
+          origin: window.location.origin  // tminhvan2.github.io
+        },
+        events: {
+          onReady: () => sendState('ready'),
+          onStateChange: (e) => sendState('stateChange', { state: e.data }),
+          onError: (e) => sendState('error', { code: e.data })
+        }
+      });
+    };
 
-    if (data.type === 'timeUpdate') {
-      const currentTime = data.currentTime; // dùng để highlight subtitle
-      syncSubtitle(currentTime);
+    // Gửi state về app
+    function sendState(type, data = {}) {
+      const currentTime = player ? player.getCurrentTime() : 0;
+      const duration = player ? player.getDuration() : 0;
+      window.parent.postMessage(
+        JSON.stringify({ type, currentTime, duration, ...data }),
+        '*'
+      );
     }
 
-    if (data.type === 'stateChange') {
-      if (data.state === 1) console.log('Playing');
-      if (data.state === 2) console.log('Paused');
-    }
-  } catch {}
-});
+    // Gửi currentTime định kỳ (để sync subtitle)
+    setInterval(() => {
+      if (player && player.getPlayerState() === YT.PlayerState.PLAYING) {
+        sendState('timeUpdate');
+      }
+    }, 500); // mỗi 500ms
+
+    // Nhận lệnh từ app
+    window.addEventListener('message', (e) => {
+      if (!player) return;
+      try {
+        const cmd = JSON.parse(e.data);
+        if (cmd.action === 'play')       player.playVideo();
+        if (cmd.action === 'pause')      player.pauseVideo();
+        if (cmd.action === 'seekTo')     player.seekTo(cmd.time, true);
+        if (cmd.action === 'getTime')    sendState('timeUpdate');
+      } catch {}
+    });
+  </script>
+</body>
+</html>
