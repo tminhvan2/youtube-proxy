@@ -17,5 +17,8 @@
   "bugs": {
     "url": "https://github.com/tminhvan2/youtube-proxy/issues"
   },
-  "homepage": "https://github.com/tminhvan2/youtube-proxy#readme"
+  "homepage": "https://github.com/tminhvan2/youtube-proxy#readme",
+  "dependencies": {
+    "youtube-transcript": "^1.3.0"
+  }
 }

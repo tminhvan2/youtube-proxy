@@ -20,36 +20,100 @@ async function viaInnerTube(videoId) {
     const r = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'User-Agent': AUA },
-      body: JSON.stringify({ context: { client: { clientName: 'ANDROID', clientVersion: AV } }, videoId }),
+      body: JSON.stringify({ context: { client: { clientName: 'ANDROID', clientVersion: AV } }, videoId, contentCheckOk: true, racyCheckOk: true }),
     });
-    if (!r.ok) return null;
+    if (!r.ok) return { error: `HTTP ${r.status}` };
     const d = await r.json();
+    const status = d?.playabilityStatus?.status;
     const t = d?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-    if (!Array.isArray(t) || !t.length) return null;
+    if (!Array.isArray(t) || !t.length) return { error: `status=${status}, reason=${d?.playabilityStatus?.reason || 'none'}` };
     return { tracks: t, title: d?.videoDetails?.title || '', dur: parseInt(d?.videoDetails?.lengthSeconds || '0', 10) };
-  } catch { return null; }
+  } catch (e) { return { error: e.message }; }
 }
 
-async function viaWebPage(videoId) {
+async function viaWebScrape(videoId) {
   try {
     const r = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
       headers: { 'User-Agent': WUA, 'Accept-Language': 'en-US,en;q=0.9', Cookie: 'CONSENT=YES+1' },
     });
-    if (!r.ok) return null;
+    if (!r.ok) return { error: `HTTP ${r.status}` };
     const h = await r.text();
-    if (h.includes('class="g-recaptcha"')) throw new Error('CAPTCHA');
-    const mk = 'var ytInitialPlayerResponse = ';
-    let ix = h.indexOf(mk), js;
-    if (ix !== -1) { js = ix + mk.length; }
-    else { ix = h.indexOf('ytInitialPlayerResponse'); if (ix === -1) return null; js = h.indexOf('{', ix); if (js === -1) return null; }
-    let dp = 0, en = -1;
-    for (let i = js; i < h.length; i++) { if (h[i] === '{') dp++; else if (h[i] === '}') dp--; if (dp === 0) { en = i; break; } }
-    if (en === -1) return null;
-    const d = JSON.parse(h.substring(js, en + 1));
-    const t = d?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-    if (!Array.isArray(t) || !t.length) return null;
-    return { tracks: t, title: d?.videoDetails?.title || '', dur: parseInt(d?.videoDetails?.lengthSeconds || '0', 10) };
-  } catch (e) { if (e.message === 'CAPTCHA') throw e; return null; }
+    if (h.includes('class="g-recaptcha"')) return { error: 'CAPTCHA' };
+    const playerResult = extractJSON(h, 'var ytInitialPlayerResponse = ');
+    if (playerResult) {
+      const t = playerResult?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+      if (Array.isArray(t) && t.length) {
+        return { tracks: t, title: playerResult?.videoDetails?.title || '', dur: parseInt(playerResult?.videoDetails?.lengthSeconds || '0', 10) };
+      }
+    }
+    const initData = extractJSON(h, 'var ytInitialData = ');
+    if (initData?.engagementPanels) {
+      for (const panel of initData.engagementPanels) {
+        const ep = panel?.engagementPanelSectionListRenderer;
+        if (ep?.panelIdentifier !== 'engagement-panel-searchable-transcript') continue;
+        const params = ep?.content?.continuationItemRenderer?.continuationEndpoint?.getTranscriptEndpoint?.params;
+        if (params) return await fetchTranscript(params, videoId);
+      }
+    }
+    const status = playerResult?.playabilityStatus?.status || 'unknown';
+    return { error: `status=${status}, no tracks, no transcript panel` };
+  } catch (e) { return { error: e.message }; }
+}
+
+function extractJSON(html, marker) {
+  const ix = html.indexOf(marker);
+  if (ix === -1) return null;
+  const start = ix + marker.length;
+  let depth = 0, end = -1;
+  for (let i = start; i < html.length; i++) {
+    if (html[i] === '{') depth++;
+    else if (html[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+  }
+  if (end === -1) return null;
+  try { return JSON.parse(html.substring(start, end + 1)); } catch { return null; }
+}
+
+async function fetchTranscript(params, videoId) {
+  try {
+    const r = await fetch('https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': WUA },
+      body: JSON.stringify({ context: { client: { clientName: 'WEB', clientVersion: '2.20250620.01.00' } }, params }),
+    });
+    if (!r.ok) return { error: `get_transcript HTTP ${r.status}` };
+    const d = await r.json();
+    const body = d?.actions?.[0]?.updateEngagementPanelAction?.content?.transcriptRenderer?.body?.transcriptBodyRenderer;
+    if (body?.cueGroups) {
+      const cues = [];
+      for (const g of body.cueGroups) {
+        const c = g?.transcriptCueGroupRenderer?.cues?.[0]?.transcriptCueRenderer;
+        if (!c) continue;
+        const text = (c.cue?.simpleText || '').trim();
+        if (text) cues.push({ text, offset: parseInt(c.startOffsetMs || '0', 10), duration: parseInt(c.durationMs || '0', 10) });
+      }
+      if (cues.length) return await wrapCues(cues, videoId);
+    }
+    const segs = d?.actions?.[0]?.updateEngagementPanelAction?.content?.transcriptRenderer?.content?.transcriptSearchPanelRenderer?.body?.transcriptSegmentListRenderer?.initialSegments;
+    if (segs) {
+      const cues = [];
+      for (const s of segs) {
+        const sr = s?.transcriptSegmentRenderer;
+        if (!sr) continue;
+        const text = (sr?.snippet?.runs?.map(r => r.text).join('') || '').trim();
+        const startMs = parseInt(sr?.startMs || '0', 10);
+        const endMs = parseInt(sr?.endMs || '0', 10);
+        if (text) cues.push({ text, offset: startMs, duration: endMs - startMs });
+      }
+      if (cues.length) return await wrapCues(cues, videoId);
+    }
+    return { error: 'get_transcript: no cue data' };
+  } catch (e) { return { error: `get_transcript: ${e.message}` }; }
+}
+
+async function wrapCues(cues, videoId) {
+  let title = '';
+  try { const o = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`); if (o.ok) title = (await o.json()).title || ''; } catch {}
+  return { cues, title, dur: Math.ceil((cues[cues.length - 1].offset + cues[cues.length - 1].duration) / 1000), source: 'get_transcript' };
 }
 
 async function getCaps(tracks, lang) {
@@ -63,10 +127,7 @@ async function getCaps(tracks, lang) {
   let cues = pP(x);
   if (!cues.length) cues = pT(x);
   if (!cues.length) return null;
-  return {
-    cues, track: { languageCode: tk.languageCode, name: tk.name?.simpleText || tk.languageCode, kind: tk.kind || null },
-    allTracks: tracks.map(t => ({ languageCode: t.languageCode, name: t.name?.simpleText || t.languageCode, kind: t.kind || null })),
-  };
+  return { cues, track: { languageCode: tk.languageCode, name: tk.name?.simpleText || tk.languageCode, kind: tk.kind || null }, allTracks: tracks.map(t => ({ languageCode: t.languageCode, name: t.name?.simpleText || t.languageCode, kind: t.kind || null })) };
 }
 
 function pP(x) {
@@ -102,20 +163,41 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
   const videoId = req.query.videoId;
+  const debug = req.query.debug === '1';
   if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) return res.status(400).json({ error: 'Invalid videoId' });
 
   try {
+    const dbg = {};
+
     let result = await viaInnerTube(videoId);
     let source = 'innertube-android';
-    if (!result) { result = await viaWebPage(videoId); source = 'web-scrape'; }
-    if (!result) return res.json({ success: false, hasCaptions: false, videoTitle: '', videoDuration: 0, message: 'Không thể truy cập video YouTube' });
+    if (result?.tracks) { if (debug) dbg.android = 'OK'; }
+    else { if (debug) dbg.android = result?.error || 'null'; result = null; }
+
+    if (!result) {
+      const ws = await viaWebScrape(videoId);
+      if (ws?.tracks) { result = ws; source = 'web-scrape'; if (debug) dbg.webScrape = 'OK'; }
+      else if (ws?.cues) {
+        if (debug) dbg.webScrape = `get_transcript: ${ws.cues.length} cues`;
+        const cues = ws.cues.map((c, i) => ({ id: `yt-${i}`, text: c.text, start: c.offset / 1000, end: (c.offset + c.duration) / 1000, words: null }));
+        return res.json({
+          success: true, hasCaptions: true, videoTitle: ws.title || '',
+          videoDuration: ws.dur || Math.ceil(cues[cues.length - 1].end),
+          subtitleData: { cues, part: 0, version: '1.0', duration: cues[cues.length - 1].end, language: 'en', cue_count: cues.length, question_uuid: '', question_number: 0 },
+          trackUsed: { languageCode: 'en', name: 'English', kind: null }, availableTracks: [], source: ws.source || 'get_transcript',
+          ...(debug ? { debug: dbg } : {}),
+        });
+      } else { if (debug) dbg.webScrape = ws?.error || 'null'; }
+    }
+
+    if (!result) {
+      let videoTitle = '';
+      try { const o = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`); if (o.ok) videoTitle = (await o.json()).title || ''; } catch {}
+      return res.json({ success: false, hasCaptions: false, videoTitle, videoDuration: 0, message: 'Không thể tự động trích xuất phụ đề. YouTube giới hạn truy cập từ server.', ...(debug ? { debug: dbg } : {}) });
+    }
 
     const cap = await getCaps(result.tracks, 'en');
-    if (!cap) return res.json({
-      success: false, hasCaptions: true, videoTitle: result.title, videoDuration: result.dur,
-      message: 'Video có phụ đề nhưng không thể tải nội dung.',
-      availableTracks: result.tracks.map(t => ({ languageCode: t.languageCode, name: t.name?.simpleText || t.languageCode, kind: t.kind || null })),
-    });
+    if (!cap) return res.json({ success: false, hasCaptions: true, videoTitle: result.title, videoDuration: result.dur, message: 'Video có phụ đề nhưng không thể tải nội dung.', availableTracks: result.tracks.map(t => ({ languageCode: t.languageCode, name: t.name?.simpleText || t.languageCode, kind: t.kind || null })) });
 
     const cues = cap.cues.map((c, i) => ({ id: `yt-${i}`, text: c.text, start: c.offset / 1000, end: (c.offset + c.duration) / 1000, words: null }));
     let title = result.title;
@@ -128,7 +210,6 @@ module.exports = async function handler(req, res) {
       trackUsed: cap.track, availableTracks: cap.allTracks, source,
     });
   } catch (err) {
-    if (err.message === 'CAPTCHA') return res.status(429).json({ error: 'YouTube yêu cầu xác minh CAPTCHA' });
     console.error('Caption error:', err);
     return res.status(500).json({ error: 'Failed: ' + (err.message || String(err)) });
   }
