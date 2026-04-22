@@ -1,5 +1,5 @@
 const ALLOWED_ORIGINS = [
-  'https://engdom.com', 'https://www.engdom.com',
+  'https://ucan.vn', 'https://www.ucan.vn',
   'http://localhost:5173', 'http://localhost:4173',
   'http://localhost:5175', 'http://localhost:5176', 'http://localhost:5177',
 ];
@@ -179,7 +179,7 @@ module.exports = async function handler(req, res) {
       if (ws?.tracks) { result = ws; source = 'web-scrape'; if (debug) dbg.webScrape = 'OK'; }
       else if (ws?.cues) {
         if (debug) dbg.webScrape = `get_transcript: ${ws.cues.length} cues`;
-        const cues = ws.cues.map((c, i) => ({ id: `yt-${i}`, text: c.text, start: c.offset / 1000, end: (c.offset + c.duration) / 1000, words: null }));
+        const cues = ws.cues.map((c, i) => ({ id: `cue-${i + 1}`, text: c.text, start: c.offset / 1000, end: (c.offset + c.duration) / 1000, words: null }));
         return res.json({
           success: true, hasCaptions: true, videoTitle: ws.title || '',
           videoDuration: ws.dur || Math.ceil(cues[cues.length - 1].end),
@@ -199,7 +199,7 @@ module.exports = async function handler(req, res) {
     const cap = await getCaps(result.tracks, 'en');
     if (!cap) return res.json({ success: false, hasCaptions: true, videoTitle: result.title, videoDuration: result.dur, message: 'Video có phụ đề nhưng không thể tải nội dung.', availableTracks: result.tracks.map(t => ({ languageCode: t.languageCode, name: t.name?.simpleText || t.languageCode, kind: t.kind || null })) });
 
-    const cues = cap.cues.map((c, i) => ({ id: `yt-${i}`, text: c.text, start: c.offset / 1000, end: (c.offset + c.duration) / 1000, words: null }));
+    const cues = cap.cues.map((c, i) => ({ id: `cue-${i + 1}`, text: c.text, start: c.offset / 1000, end: (c.offset + c.duration) / 1000, words: null }));
     let title = result.title;
     if (!title) { try { const o = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`); if (o.ok) title = (await o.json()).title || ''; } catch {} }
 
